@@ -3,7 +3,7 @@
  *
  * 执行模式：
  * 1. Tauri 模式     — 内嵌 WebView 注入 JS
- * 2. HTTP 提交模式  — 本地代理服务器真实 POST（推荐）
+ * 2. HTTP 提交模式  — 本地代理服务器真实 POST
  * 3. 模拟降级模式   — 代理未启动时仅打印日志
  */
 
@@ -37,18 +37,20 @@ export async function executeTask(task, onLog, onCaptcha) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTTP 提交模式（核心）
+// HTTP 提交模式
 // ─────────────────────────────────────────────────────────────────────────────
 async function executeHTTP(task, log, onCaptcha) {
-  // 1. 抓取表单页面，提取 action/method/hidden字段
+  // 1. 抓取表单页面，获取 action/method/hidden 字段
   log('info', '正在抓取表单页面...')
   let formAction = task.url
   let formMethod = 'POST'
-  let hiddenFields = []   // [{ key, value }]
-  let pageCookies = ''    // Set-Cookie from page response
+  let hiddenFields = []
+  let pageCookies = ''
+  let pageHtml = ''
 
   try {
     const { html, cookies } = await fetchPageWithCookies(task.url)
+    pageHtml = html
     pageCookies = cookies
 
     const doc = new DOMParser().parseFromString(html, 'text/html')
@@ -58,14 +60,11 @@ async function executeHTTP(task, log, onCaptcha) {
       if (action) formAction = new URL(action, task.url).href
       formMethod = (form.getAttribute('method') || 'POST').toUpperCase()
 
-      // ★ 提取所有 hidden 字段（这是之前缺失的关键步骤）
       form.querySelectorAll('input[type="hidden"]').forEach(el => {
-        if (el.name) {
-          hiddenFields.push({ key: el.name, value: el.value || '' })
-        }
+        if (el.name) hiddenFields.push({ key: el.name, value: el.value || '' })
       })
       if (hiddenFields.length > 0) {
-        log('info', `发现 ${hiddenFields.length} 个隐藏字段: ${hiddenFields.map(f => f.key).join(', ')}`)
+        log('info', `发现 ${hiddenFields.length} 个隐藏字段: ${hiddenFields.map(f => `${f.key}="${f.value}"`).join(', ')}`)
       }
     }
   } catch (e) {
@@ -74,43 +73,57 @@ async function executeHTTP(task, log, onCaptcha) {
 
   log('info', `提交地址: ${formAction} [${formMethod}]`)
 
-  // 2. 去重用户配置字段
+  // 2. 处理验证码字段
   const userFields = deduplicateFields(task.config?.fields || [])
 
-  // 3. 处理验证码（在构建提交数据前，需要先填好验证码值）
   for (const field of userFields) {
     if (!field.isCaptcha) continue
 
     log('info', `处理验证码字段: "${field.label || field.key}"`)
-    const captchaImgUrl = await findCaptchaImgUrl(task.url, field.selector)
+
+    // 先在页面里找验证码图片
+    const captchaImgUrl = findCaptchaImgInHtml(pageHtml, task.url, field.selector)
 
     if (captchaImgUrl) {
+      log('info', `找到验证码图片: ${captchaImgUrl}`)
       const dataUrl = await fetchCaptchaAsBase64(captchaImgUrl, task.url)
-      const solver = task.config?.captcha?.solver || 'tesseract'
 
-      if (solver === 'manual') {
-        field.fillValue = (await onCaptcha?.(dataUrl)) || ''
-        log('info', `人工输入验证码: "${field.fillValue}"`)
+      if (!dataUrl) {
+        log('warn', '验证码图片下载失败，转为人工输入')
+        field.fillValue = (await onCaptcha?.('')) || ''
       } else {
-        log('info', 'OCR 识别中...')
-        field.fillValue = await recognizeCaptcha(dataUrl)
-        log('info', `OCR 结果: "${field.fillValue}"`)
+        const solver = task.config?.captcha?.solver || 'tesseract'
+        if (solver === 'manual') {
+          field.fillValue = (await onCaptcha?.(dataUrl)) || ''
+          log('info', `人工输入验证码: "${field.fillValue}"`)
+        } else {
+          log('info', 'OCR 识别中...')
+          const ocrResult = await recognizeCaptcha(dataUrl)
+          log('info', `OCR 结果: "${ocrResult}"`)
+
+          if (ocrResult) {
+            field.fillValue = ocrResult
+          } else {
+            // ★ OCR 失败 → 自动回退到人工输入
+            log('warn', 'OCR 识别失败，自动转为人工输入模式')
+            field.fillValue = (await onCaptcha?.(dataUrl)) || ''
+            log('info', `人工输入验证码: "${field.fillValue}"`)
+          }
+        }
       }
     } else {
-      log('warn', '未找到验证码图片，验证码字段将为空')
-      field.fillValue = ''
+      // ★ 找不到图片 → 人工输入（传空 dataUrl 让面板显示提示）
+      log('warn', '未在页面中找到验证码图片，请人工输入')
+      field.fillValue = (await onCaptcha?.('')) || ''
+      log('info', `人工输入验证码: "${field.fillValue}"`)
     }
   }
 
-  // 4. 合并字段：hidden 字段优先（保留原始值），用户字段覆盖同名 hidden 字段
-  //    最终提交顺序：hidden fields + user fields（同 key 的以 user 为准）
-  const hiddenMap = new Map(hiddenFields.map(f => [f.key, f.value]))
-  const userMap   = new Map(userFields.map(f => [f.key, f]))
-
-  // 构建最终字段列表
+  // 3. 合并字段：hidden 字段保留原始值，用户字段覆盖同名 hidden
+  const userMap = new Map(userFields.map(f => [f.key, f]))
   const finalFields = []
 
-  // 先放 hidden（用户没有配置的才用原始值）
+  // 先放不被用户字段覆盖的 hidden
   for (const { key, value } of hiddenFields) {
     if (!userMap.has(key)) {
       finalFields.push({ key, fillValue: value, type: 'hidden' })
@@ -125,15 +138,19 @@ async function executeHTTP(task, log, onCaptcha) {
     finalFields.push(field)
   }
 
-  // 5. 打印提交清单
+  // 4. 打印提交清单
   log('info', '─── 提交字段清单 ───')
   for (const f of finalFields) {
     const val = f.fillValue != null ? String(f.fillValue) : ''
-    const tag = f.type === 'hidden' ? '[hidden]' : f.isCaptcha ? '[验证码]' : ''
-    log('info', `  ${f.key} = "${val}" ${tag}`)
+    const tag = f.type === 'hidden' ? ' [hidden]' : f.isCaptcha ? ' [验证码]' : ''
+    if (!val && f.type !== 'hidden') {
+      log('warn', `  ${f.key} = "" ← 空值`)
+    } else {
+      log('info', `  ${f.key} = "${val.slice(0, 60)}"${tag}`)
+    }
   }
 
-  // 6. 发送提交请求
+  // 5. 提交
   log('info', '正在提交...')
   try {
     const resp = await fetch(`${PROXY_BASE}/api/submit`, {
@@ -149,7 +166,7 @@ async function executeHTTP(task, log, onCaptcha) {
     })
 
     const result = await resp.json()
-    analyzeSubmitResult(result, log)
+    analyzeSubmitResult(result, log, task.url)
   } catch (e) {
     log('error', `提交请求失败: ${e.message}`)
     throw e
@@ -157,9 +174,9 @@ async function executeHTTP(task, log, onCaptcha) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 分析提交结果
+// 结果分析（不再轻易报"成功"）
 // ─────────────────────────────────────────────────────────────────────────────
-function analyzeSubmitResult(result, log) {
+function analyzeSubmitResult(result, log, originalUrl) {
   if (!result.ok) {
     log('error', `提交失败，HTTP ${result.status}`)
     if (result.error) log('error', result.error)
@@ -167,45 +184,54 @@ function analyzeSubmitResult(result, log) {
   }
 
   const html = result.responseText || ''
-  const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+  // 去除 HTML 标签，提取纯文本
+  const text = html.replace(/<script[\s\S]*?<\/script>/gi, '')
+                   .replace(/<style[\s\S]*?<\/style>/gi, '')
+                   .replace(/<[^>]+>/g, ' ')
+                   .replace(/\s+/g, ' ')
+                   .trim()
 
-  // 检查常见错误关键词（中/日/英）
-  const errorPatterns = [
-    /エラー|error|错误|失败|失敗|invalid|不正|不能|cannot|NG/i,
-    /regikey|登録キー|注册密钥/i,
-    /incorrect|wrong|mismatch/i,
-    /spam|bot|captcha/i,
-  ]
+  // 判断是否跳转了（和原 URL 不同通常说明处理成功）
+  const redirected = result.finalUrl && result.finalUrl !== originalUrl
+
+  // 明确成功关键词（中/日/英）
   const successPatterns = [
-    /投稿しました|投稿完了|posted|success|成功|完了|ありがとう|thank/i,
-    /書き込み.*完了|完成|registered/i,
+    /投稿しました|投稿完了|書き込み.*完了|送信.*完了|登録.*完了/,
+    /success|posted|registered|完成|成功|ありがとうございました/i,
+    /記事が投稿|コメントが送信|メッセージが/,
+  ]
+  // 明确失败关键词
+  const errorPatterns = [
+    /エラー|error|错误|失敗|失败|invalid|不正|incorrec|NG\b/i,
+    /認証.*失敗|captcha.*wrong|画像認証|入力.*間違/,
+    /regikey|登録キー|スパム|spam/i,
+    /もう一度|再入力|やり直|try again/i,
   ]
 
-  const foundError = errorPatterns.find(p => p.test(text))
   const foundSuccess = successPatterns.find(p => p.test(text))
+  const foundError = errorPatterns.find(p => p.test(text))
 
-  if (foundSuccess) {
-    log('success', `✅ 提交成功！（页面确认: "${extractMatch(text, foundSuccess)}"）`)
-    log('info', `最终 URL: ${result.finalUrl}`)
+  // 提取响应文本摘要（前 400 字）
+  const snippet = text.slice(0, 400)
+
+  if (foundSuccess && !foundError) {
+    log('success', `✅ 提交成功！`)
+    if (redirected) log('success', `跳转到: ${result.finalUrl}`)
+    log('info', `页面内容: ${snippet}`)
   } else if (foundError) {
-    log('error', `⚠️ 服务端返回错误: "${extractMatch(text, foundError)}"`)
+    log('error', `❌ 服务端返回错误！`)
     log('error', `最终 URL: ${result.finalUrl}`)
-    // 打印响应片段帮助调试
-    const snippet = text.slice(0, 300)
-    log('warn', `响应摘要: ${snippet}`)
-  } else {
-    // 不确定，打印 URL 和摘要
-    log('info', `提交完成（HTTP ${result.status}），最终 URL: ${result.finalUrl}`)
-    const snippet = text.slice(0, 200)
+    log('warn', `页面内容: ${snippet}`)
+  } else if (redirected) {
+    // 有跳转但无法判断，大概率成功
+    log('success', `✅ 提交完成，页面已跳转到: ${result.finalUrl}`)
     log('info', `响应摘要: ${snippet}`)
+  } else {
+    // 无法判断
+    log('warn', `⚠️ 提交完成，但无法确认结果（HTTP ${result.status}）`)
+    log('warn', `最终 URL: ${result.finalUrl}`)
+    log('warn', `响应内容（前400字）: ${snippet}`)
   }
-}
-
-function extractMatch(text, pattern) {
-  const m = text.match(pattern)
-  if (!m) return ''
-  const idx = text.indexOf(m[0])
-  return text.slice(Math.max(0, idx - 20), idx + 60).trim()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,7 +261,6 @@ async function executeTauri(task, log, onCaptcha) {
   await sleep(task.config?.delay ?? 500)
 
   const fields = deduplicateFields(task.config?.fields || [])
-
   for (const field of fields) {
     await sleep(200)
     if (field.isCaptcha) {
@@ -245,7 +270,7 @@ async function executeTauri(task, log, onCaptcha) {
         captchaText = (await onCaptcha?.(dataUrl)) || ''
       } else {
         captchaText = await recognizeCaptcha(dataUrl)
-        log('info', `OCR: "${captchaText}"`)
+        if (!captchaText) captchaText = (await onCaptcha?.(dataUrl)) || ''
       }
       if (captchaText) await fillElement(win, field.selector, captchaText)
       continue
@@ -265,14 +290,14 @@ async function executeTauri(task, log, onCaptcha) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 模拟降级模式
+// 模拟降级
 // ─────────────────────────────────────────────────────────────────────────────
 async function executeSimulate(task, log) {
   log('info', '[模拟] 演示流程（不真实提交）')
   const fields = deduplicateFields(task.config?.fields || [])
   for (const field of fields) {
     await sleep(200)
-    if (field.isCaptcha) { log('info', `[模拟] 验证码字段 → OCR: "DEMO"`); continue }
+    if (field.isCaptcha) { log('info', `[模拟] 验证码字段`); continue }
     if (!field.fillValue && field.fillValue !== 0) { log('warn', `[模拟] "${field.label || field.key}" 无值，跳过`); continue }
     log('info', `[模拟] 填充 "${field.label || field.key}" = "${field.fillValue}"`)
   }
@@ -286,11 +311,7 @@ async function executeSimulate(task, log) {
 
 function deduplicateFields(fields) {
   const seen = new Set()
-  return fields.filter(f => {
-    if (seen.has(f.key)) return false
-    seen.add(f.key)
-    return true
-  })
+  return fields.filter(f => { if (seen.has(f.key)) return false; seen.add(f.key); return true })
 }
 
 async function checkProxy() {
@@ -300,36 +321,72 @@ async function checkProxy() {
   } catch { return false }
 }
 
-/** 抓取页面 HTML，同时返回 Set-Cookie 值（用于 session 维持） */
 async function fetchPageWithCookies(url) {
-  const resp = await fetch(
-    `${PROXY_BASE}/api/proxy?url=${encodeURIComponent(url)}`,
-    { signal: AbortSignal.timeout(12000) }
-  )
+  const resp = await fetch(`${PROXY_BASE}/api/proxy?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(12000) })
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
   const html = await resp.text()
   const cookies = resp.headers.get('x-set-cookie') || ''
   return { html, cookies }
 }
 
-/** 从页面 DOM 找验证码图片的 URL */
-async function findCaptchaImgUrl(pageUrl, inputSelector) {
+/**
+ * 在已有 HTML 字符串中找验证码图片 URL
+ * 不再重复请求页面，直接用已抓取的 HTML
+ */
+function findCaptchaImgInHtml(html, baseUrl, inputSelector) {
+  if (!html) return null
   try {
-    const { html } = await fetchPageWithCookies(pageUrl)
     const doc = new DOMParser().parseFromString(html, 'text/html')
+
+    // 1. 用选择器找输入框旁的图片
     const input = doc.querySelector(inputSelector)
-    if (!input) return null
-    const root = input.closest('.captcha,.verify-group,form,.form-group,tr,td') || input.parentElement
-    const img = root?.querySelector('img[src*="captcha"],img[src*="verify"],img[src*="code"],img[src*="check"],img')
-    if (!img?.getAttribute('src')) return null
-    return new URL(img.getAttribute('src'), pageUrl).href
+    if (input) {
+      const root = input.closest('.captcha,.verify-group,form,.form-group,tr,td') || input.parentElement
+      if (root) {
+        const img = root.querySelector(
+          'img[src*="captcha"],img[src*="verify"],img[src*="code"],img[src*="check"],img[src*="kana"],img[src*="num"]'
+        )
+        if (img?.getAttribute('src')) {
+          return new URL(img.getAttribute('src'), baseUrl).href
+        }
+        // 任意 img（如只有一张图片在表单里）
+        const anyImg = root.querySelector('img')
+        if (anyImg?.getAttribute('src')) {
+          return new URL(anyImg.getAttribute('src'), baseUrl).href
+        }
+      }
+    }
+
+    // 2. 全局搜索常见验证码图片
+    const allImgs = doc.querySelectorAll('img')
+    for (const img of allImgs) {
+      const src = img.getAttribute('src') || ''
+      if (/captcha|verify|code|kana|check|num|secur/i.test(src)) {
+        return new URL(src, baseUrl).href
+      }
+    }
+
+    // 3. 找 img 标签的 alt/class/id 含验证码关键字
+    for (const img of allImgs) {
+      const alt = img.getAttribute('alt') || ''
+      const cls = img.className || ''
+      const id = img.id || ''
+      if (/captcha|verify|認証|验证/i.test(alt + cls + id)) {
+        const src = img.getAttribute('src')
+        if (src) return new URL(src, baseUrl).href
+      }
+    }
+
+    return null
   } catch { return null }
 }
 
-/** 通过代理下载验证码图片为 base64 dataURL */
 async function fetchCaptchaAsBase64(imgUrl, referer) {
   try {
-    const r = await fetch(`${PROXY_BASE}/api/captcha?url=${encodeURIComponent(imgUrl)}&referer=${encodeURIComponent(referer)}`, { signal: AbortSignal.timeout(8000) })
+    const r = await fetch(
+      `${PROXY_BASE}/api/captcha?url=${encodeURIComponent(imgUrl)}&referer=${encodeURIComponent(referer)}`,
+      { signal: AbortSignal.timeout(8000) }
+    )
     const { dataUrl } = await r.json()
     return dataUrl || ''
   } catch { return '' }
