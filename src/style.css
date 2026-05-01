@@ -1,0 +1,54 @@
+:root {
+  --color-bg: #0f0f23;
+  --color-surface: #1a1a2e;
+  --color-border: #2a2a4a;
+  --color-text: #e0e0e0;
+  --color-muted: #666;
+  --color-primary: #409eff;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+#app {
+  height: 100%;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0f0f23; }
+::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #5a5a8a; }
+
+/* Element Plus dark overrides */
+.el-button--primary { --el-button-bg-color: #409eff; }
+.el-dialog { background: #1a1a2e !important; border: 1px solid #2a2a4a; }
+.el-dialog .el-dialog__title { color: #fff !important; }
+.el-dialog .el-dialog__body { color: #e0e0e0 !important; }
+.el-form-item__label { color: #aaa !important; }
+.el-select .el-input__wrapper { background: #0f0f23 !important; }
+.el-select-dropdown { background: #1a1a2e !important; border-color: #2a2a4a !important; }
+.el-select-dropdown__item { color: #ccc !important; }
+.el-select-dropdown__item.is-hovering { background: #2a2a4a !important; }
+.el-select-dropdown__item.is-selected { color: #409eff !important; }
+.el-collapse { border-color: #2a2a4a !important; background: transparent !important; }
+.el-collapse-item__header { background: #1a1a2e !important; color: #ccc !important; border-color: #2a2a4a !important; }
+.el-collapse-item__content { background: #16213e !important; padding: 16px !important; }
+.el-collapse-item__wrap { border-color: #2a2a4a !important; }
+.el-step__title { color: #888 !important; }
+.el-step__title.is-process, .el-step__title.is-finish { color: #fff !important; }
+.el-tag { --el-tag-border-color: transparent; }
+.el-result__title p { color: #fff !important; }
+.el-result__subtitle p { color: #aaa !important; }
+.el-popconfirm__action { display: flex; gap: 8px; }
+.el-divider { border-color: #2a2a4a !important; }
+.el-divider__text { background: #1a1a2e !important; color: #666 !important; }
+.el-alert { background: rgba(245,108,108,0.1) !important; border-color: rgba(245,108,108,0.3) !important; }
+.el-alert--warning { background: rgba(230,162,60,0.1) !important; border-color: rgba(230,162,60,0.3) !important; }
+.el-progress-bar__outer { background: #2a2a4a !important; }
+.el-steps--horizontal { padding: 20px 0; }
