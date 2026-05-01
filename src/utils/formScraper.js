@@ -3,7 +3,6 @@
  * 解析 HTML，提取表单字段信息
  */
 
-// 字段类型映射
 const INPUT_TYPE_MAP = {
   text: 'text',
   email: 'email',
@@ -23,31 +22,27 @@ const INPUT_TYPE_MAP = {
 
 /**
  * 从 HTML 字符串解析表单字段
- * @param {string} html
- * @returns {Array} fields
  */
 export function parseFormFields(html) {
   const parser = new DOMParser()
   const doc = parser.parseFromString(html, 'text/html')
   const fields = []
 
-  // 优先抓取 <form> 内的字段，否则全局扫描
+  // 优先抓取 <form> 内，否则全局扫描
   const forms = doc.querySelectorAll('form')
   const container = forms.length > 0 ? forms[0] : doc.body
 
-  // 处理 input
+  // 处理 input —— 注意：传入 doc 供内部查找 label
   container.querySelectorAll('input').forEach(el => {
     const type = el.type?.toLowerCase() || 'text'
-    if (type === 'submit' || type === 'button' || type === 'reset' || type === 'image') return
-    if (type === 'hidden') return // 暂时跳过 hidden
-
-    const field = buildField(el, type)
+    if (['submit', 'button', 'reset', 'image', 'hidden'].includes(type)) return
+    const field = buildField(el, type, doc)
     if (field) fields.push(field)
   })
 
   // 处理 textarea
   container.querySelectorAll('textarea').forEach(el => {
-    const field = buildField(el, 'textarea')
+    const field = buildField(el, 'textarea', doc)
     if (field) fields.push(field)
   })
 
@@ -57,7 +52,7 @@ export function parseFormFields(html) {
       value: o.value,
       label: o.textContent.trim(),
     }))
-    const field = buildField(el, 'select')
+    const field = buildField(el, 'select', doc)
     if (field) {
       field.options = options
       fields.push(field)
@@ -67,23 +62,27 @@ export function parseFormFields(html) {
   return fields
 }
 
-function buildField(el, type) {
+/**
+ * @param {Element} el
+ * @param {string} type
+ * @param {Document} doc  ← 必须传入解析后的 doc，不能用全局 document
+ */
+function buildField(el, type, doc) {
   const name = el.name || el.id || el.getAttribute('data-name') || null
   if (!name) return null
 
-  // 寻找关联 label
+  // 在解析后的 doc 里查找关联 label（修复：原来用了全局 document）
   let label = ''
-  if (el.id) {
-    const labelEl = document.querySelector?.(`label[for="${el.id}"]`)
+  if (el.id && doc) {
+    const labelEl = doc.querySelector(`label[for="${el.id}"]`)
     if (labelEl) label = labelEl.textContent.trim()
   }
   if (!label) label = el.placeholder || el.getAttribute('aria-label') || name
 
-  // 判断是否验证码
   const isCaptcha =
     /captcha|验证码|code|verify/i.test(name) ||
-    /captcha|验证码/i.test(el.className) ||
-    /captcha|验证码/i.test(el.id)
+    /captcha|验证码/i.test(el.className || '') ||
+    /captcha|验证码/i.test(el.id || '')
 
   return {
     key: name,
@@ -94,53 +93,81 @@ function buildField(el, type) {
     defaultValue: el.value || '',
     isCaptcha,
     selector: buildSelector(el),
-    fillValue: '', // 用户后续填写
+    fillValue: '',
+    options: [],
   }
 }
 
 function buildSelector(el) {
-  if (el.id) return `#${el.id}`
+  if (el.id) return `#${CSS.escape ? CSS.escape(el.id) : el.id}`
   if (el.name) return `[name="${el.name}"]`
   return el.tagName.toLowerCase()
 }
 
 /**
- * 通过 fetch 抓取目标 URL 的 HTML（需后端代理）
- * 在 Tauri 中直接发起请求，浏览器中通过后端代理
+ * 抓取目标 URL 的 HTML
+ * - Tauri 环境：调用 Rust 后端命令（无跨域限制）
+ * - 浏览器开发环境：走 allorigins.win CORS 代理，或本地代理
  */
 export async function fetchPageHTML(url) {
-  // 在 Tauri 环境中，直接用 Tauri HTTP 插件
   if (typeof window.__TAURI__ !== 'undefined') {
+    // Tauri: 调用 Rust 后端 fetch，彻底无 CORS 限制
     try {
-      const { fetch: tauriFetch } = await import('@tauri-apps/api/http')
-      const resp = await tauriFetch(url, {
-        method: 'GET',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; KiloBot/1.0)' },
-      })
-      return resp.data
+      const { invoke } = await import('@tauri-apps/api/tauri')
+      return await invoke('fetch_page_html', { url })
     } catch (e) {
-      throw new Error(`抓取失败: ${e.message}`)
+      throw new Error(`Tauri 抓取失败: ${e}`)
     }
   }
 
-  // 浏览器环境 — 走代理（开发阶段）
-  const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`
-  const resp = await fetch(proxyUrl)
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-  return resp.text()
+  // 浏览器模式：先尝试本地代理，再 fallback 到 allorigins
+  const errors = []
+
+  // 1. 本地 Vite 代理（npm run dev 时可用）
+  try {
+    const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`
+    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(5000) })
+    if (resp.ok) return resp.text()
+    errors.push(`本地代理 HTTP ${resp.status}`)
+  } catch (e) {
+    errors.push(`本地代理不可用: ${e.message}`)
+  }
+
+  // 2. allorigins.win 公共 CORS 代理
+  try {
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) })
+    if (resp.ok) return resp.text()
+    errors.push(`allorigins HTTP ${resp.status}`)
+  } catch (e) {
+    errors.push(`allorigins 失败: ${e.message}`)
+  }
+
+  // 3. corsproxy.io 备用
+  try {
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`
+    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) })
+    if (resp.ok) return resp.text()
+    errors.push(`corsproxy HTTP ${resp.status}`)
+  } catch (e) {
+    errors.push(`corsproxy 失败: ${e.message}`)
+  }
+
+  throw new Error(`所有代理均失败:\n${errors.join('\n')}\n\n请手动粘贴页面 HTML。`)
 }
 
 /**
- * 从截图/Canvas 数据识别验证码 (Tesseract)
+ * OCR 识别验证码 (Tesseract.js)
  */
 export async function recognizeCaptcha(imageData) {
+  if (!imageData) return ''
   try {
-    // 动态加载 Tesseract.js
     const { createWorker } = await import('tesseract.js')
     const worker = await createWorker('eng')
+    await worker.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789' })
     const { data: { text } } = await worker.recognize(imageData)
     await worker.terminate()
-    return text.trim().replace(/\s/g, '')
+    return text.trim().replace(/\s+/g, '')
   } catch (e) {
     console.error('OCR 失败:', e)
     return ''

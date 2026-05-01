@@ -195,13 +195,18 @@ const captchaInput = ref('')
 let captchaResolve = null
 let stopped = false
 
+// 所有有 config 的任务都可执行（包括 pending 状态但已手动配置的）
 const configuredTasks = computed(() =>
-  taskStore.tasks.filter(t => t.status === 'configured' || t.status === 'done' || t.status === 'error')
+  taskStore.tasks.filter(t => t.config?.fields?.length > 0)
 )
 
 onMounted(async () => {
   await taskStore.loadTasks()
+  // 优先从路由参数加载；其次选第一个可用任务
   if (selectedTaskId.value) {
+    await loadSelectedTask(selectedTaskId.value)
+  } else if (configuredTasks.value.length > 0) {
+    selectedTaskId.value = configuredTasks.value[0].id
     await loadSelectedTask(selectedTaskId.value)
   }
 })
