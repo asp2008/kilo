@@ -25,20 +25,52 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type',
 }
 
-const httpServer = createServer((req, res) => {
+const httpServer = createServer(async (req, res) => {
   // OPTIONS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS_HEADERS)
     res.end()
     return
   }
-  if (req.url === '/health') {
+
+  const reqUrl = new URL(req.url, `http://127.0.0.1:${PORT}`)
+
+  // ── GET /health ──
+  if (reqUrl.pathname === '/health') {
     res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ ok: true }))
-  } else {
-    res.writeHead(404, CORS_HEADERS)
-    res.end()
+    return
   }
+
+  // ── GET /fetch?url=... ── 服务端抓取页面 HTML，彻底无跨域限制
+  if (reqUrl.pathname === '/fetch' && req.method === 'GET') {
+    const targetUrl = reqUrl.searchParams.get('url')
+    if (!targetUrl) {
+      res.writeHead(400, CORS_HEADERS)
+      res.end(JSON.stringify({ error: '缺少 url 参数' }))
+      return
+    }
+    try {
+      const b = await getBrowser()
+      const ctx = await b.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      })
+      const page = await ctx.newPage()
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 })
+      const html = await page.content()
+      await ctx.close()
+      res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(html)
+    } catch (e) {
+      console.error('[fetch]', e.message)
+      res.writeHead(502, CORS_HEADERS)
+      res.end(JSON.stringify({ error: e.message }))
+    }
+    return
+  }
+
+  res.writeHead(404, CORS_HEADERS)
+  res.end()
 })
 
 const wss = new WebSocketServer({

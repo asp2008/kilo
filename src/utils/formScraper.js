@@ -107,12 +107,11 @@ function buildSelector(el) {
 
 /**
  * 抓取目标 URL 的 HTML
- * - Tauri 环境：调用 Rust 后端命令（无跨域限制）
- * - 浏览器开发环境：走 allorigins.win CORS 代理，或本地代理
+ * 优先级：Playwright 引擎 > Tauri 后端 > 手动提示
  */
 export async function fetchPageHTML(url) {
+  // 1. Tauri 环境：Rust 后端直接 fetch
   if (typeof window.__TAURI__ !== 'undefined') {
-    // Tauri: 调用 Rust 后端 fetch，彻底无 CORS 限制
     try {
       const { invoke } = await import('@tauri-apps/api/tauri')
       return await invoke('fetch_page_html', { url })
@@ -121,40 +120,21 @@ export async function fetchPageHTML(url) {
     }
   }
 
-  // 浏览器模式：先尝试本地代理，再 fallback 到 allorigins
-  const errors = []
-
-  // 1. 本地 Vite 代理（npm run dev 时可用）
+  // 2. Playwright 引擎（无 CORS，支持 JS 渲染页面）
   try {
-    const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`
-    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(5000) })
+    const resp = await fetch(
+      `http://127.0.0.1:3002/fetch?url=${encodeURIComponent(url)}`,
+      { signal: AbortSignal.timeout(25000) }
+    )
     if (resp.ok) return resp.text()
-    errors.push(`本地代理 HTTP ${resp.status}`)
+    throw new Error(`HTTP ${resp.status}`)
   } catch (e) {
-    errors.push(`本地代理不可用: ${e.message}`)
+    throw new Error(
+      `抓取失败: ${e.message}\n\n` +
+      `请确认 Playwright 引擎已启动（npm run dev 会自动启动），\n` +
+      `或手动粘贴页面 HTML。`
+    )
   }
-
-  // 2. allorigins.win 公共 CORS 代理
-  try {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
-    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) })
-    if (resp.ok) return resp.text()
-    errors.push(`allorigins HTTP ${resp.status}`)
-  } catch (e) {
-    errors.push(`allorigins 失败: ${e.message}`)
-  }
-
-  // 3. corsproxy.io 备用
-  try {
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`
-    const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) })
-    if (resp.ok) return resp.text()
-    errors.push(`corsproxy HTTP ${resp.status}`)
-  } catch (e) {
-    errors.push(`corsproxy 失败: ${e.message}`)
-  }
-
-  throw new Error(`所有代理均失败:\n${errors.join('\n')}\n\n请手动粘贴页面 HTML。`)
 }
 
 /**
