@@ -71,6 +71,12 @@
         <el-table-column label="字段名" prop="key" width="140" />
         <el-table-column label="标签" prop="label" width="130" />
         <el-table-column label="类型" prop="type" width="100" />
+        <el-table-column label="隐藏" width="70">
+          <template #default="{ row }">
+            <el-tag v-if="row.type === 'hidden'" type="info" size="small">是</el-tag>
+            <span v-else class="muted">否</span>
+          </template>
+        </el-table-column>
         <el-table-column label="验证码" width="80">
           <template #default="{ row }">
             <el-tag v-if="row.isCaptcha" type="warning" size="small">是</el-tag>
@@ -131,11 +137,24 @@
         </el-collapse-item>
       </el-collapse>
 
-      <!-- 字段填充表 -->
+      <!-- Hidden 字段提示 -->
+      <el-alert
+        v-if="hiddenFields.length > 0"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+      >
+        <template #title>
+          发现 {{ hiddenFields.length }} 个隐藏字段（自动携带原始值）：{{ hiddenFields.map(f => f.key).join(', ') }}
+        </template>
+      </el-alert>
+
+      <!-- 字段填充表（只显示非 hidden 字段）-->
       <h4 style="margin-bottom: 12px; color: #aaa">字段填充值</h4>
       <el-form label-position="top">
         <el-row :gutter="16">
-          <el-col :span="12" v-for="(field, idx) in parsedFields" :key="field.key">
+          <el-col :span="12" v-for="(field, idx) in visibleFields" :key="field.key">
             <el-form-item>
               <template #label>
                 <span>{{ field.label || field.key }}</span>
@@ -190,7 +209,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTaskStore } from '../stores/taskStore'
 import { parseFormFields, fetchPageHTML } from '../utils/formScraper'
@@ -222,6 +241,11 @@ const captchaConfig = ref({
 })
 
 const taskId = route.params.id
+
+// Hidden 字段（自动携带）
+const hiddenFields = computed(() => parsedFields.value.filter(f => f.type === 'hidden'))
+// 可见字段（用户可编辑）
+const visibleFields = computed(() => parsedFields.value.filter(f => f.type !== 'hidden'))
 
 onMounted(async () => {
   if (taskId) {

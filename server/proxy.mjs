@@ -46,6 +46,11 @@ app.get('/api/proxy', async (req, res) => {
     const contentType = resp.headers.get('content-type') || 'text/html'
     const body = await resp.text()
 
+    // ★ 把 Set-Cookie 透传给前端（用于 session 维持）
+    const setCookie = resp.headers.raw?.()?.['set-cookie'] || []
+    if (setCookie.length > 0) {
+      res.setHeader('X-Set-Cookie', setCookie.join('; '))
+    }
     res.setHeader('Content-Type', contentType)
     res.setHeader('X-Final-Url', resp.url)
     res.status(resp.status).send(body)
@@ -102,9 +107,16 @@ app.post('/api/submit', async (req, res) => {
   // 构建表单数据
   const params = new URLSearchParams()
   for (const field of fields) {
-    if (field.type === 'file') continue // file 类型跳过（需要 multipart，后续支持）
+    if (field.type === 'file') continue
     const val = field.fillValue != null ? String(field.fillValue) : ''
     params.append(field.key, val)
+  }
+
+  console.log(`[submit] 字段列表:`);
+  for (const field of fields) {
+    if (field.type === 'file') continue
+    const val = field.fillValue != null ? String(field.fillValue) : ''
+    console.log(`  ${field.key} = "${val.slice(0,80)}"`);
   }
 
   const headers = {
@@ -139,11 +151,14 @@ app.post('/api/submit', async (req, res) => {
 
     console.log(`[submit] response: ${resp.status} → ${finalUrl}`)
 
+    // 返回更全的响应信息
+    const respCookies = resp.headers.raw?.()?.['set-cookie'] || []
     res.json({
       ok: resp.status < 400,
       status: resp.status,
       finalUrl,
-      responseText: responseText.slice(0, 5000), // 返回前 5000 字符用于调试
+      setCookies: respCookies,
+      responseText: responseText.slice(0, 8000),
     })
   } catch (e) {
     console.error('[submit] error:', e.message)

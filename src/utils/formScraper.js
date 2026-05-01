@@ -32,10 +32,11 @@ export function parseFormFields(html) {
   const forms = doc.querySelectorAll('form')
   const container = forms.length > 0 ? forms[0] : doc.body
 
-  // 处理 input —— 注意：传入 doc 供内部查找 label
+  // 处理 input
   container.querySelectorAll('input').forEach(el => {
     const type = el.type?.toLowerCase() || 'text'
-    if (['submit', 'button', 'reset', 'image', 'hidden'].includes(type)) return
+    if (['submit', 'button', 'reset', 'image'].includes(type)) return
+    // hidden 字段保留，用于提交时不遗漏 session/token
     const field = buildField(el, type, doc)
     if (field) fields.push(field)
   })
