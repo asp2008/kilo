@@ -19,16 +19,33 @@ import { multiCandidateOcr } from './ocr-helper.mjs'
 
 const PORT = 3002
 
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+}
+
 const httpServer = createServer((req, res) => {
+  // OPTIONS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, CORS_HEADERS)
+    res.end()
+    return
+  }
   if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ ok: true }))
   } else {
-    res.writeHead(404); res.end()
+    res.writeHead(404, CORS_HEADERS)
+    res.end()
   }
 })
 
-const wss = new WebSocketServer({ server: httpServer })
+const wss = new WebSocketServer({
+  server: httpServer,
+  // 允许任意来源连接（前端 localhost:5173 访问 127.0.0.1:3002）
+  verifyClient: () => true,
+})
 
 let browser = null
 async function getBrowser() {
