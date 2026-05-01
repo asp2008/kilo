@@ -86,6 +86,29 @@
 
       <!-- 右侧：执行控制 + 日志 -->
       <el-col :span="14">
+        <!-- 代理服务器状态 -->
+        <el-alert
+          v-if="proxyStatus === 'offline'"
+          class="mb-4"
+          type="warning"
+          :closable="false"
+          show-icon
+        >
+          <template #title>
+            本地代理服务器未启动，无法真实提交
+          </template>
+          <span>请在终端运行：<code>node server/proxy.mjs</code>，然后点击「刷新状态」</span>
+          <el-button size="small" style="margin-left:10px" @click="checkProxyStatus">刷新状态</el-button>
+        </el-alert>
+        <el-alert
+          v-else-if="proxyStatus === 'online'"
+          class="mb-4"
+          type="success"
+          :closable="false"
+          show-icon
+          title="代理服务器已连接，将使用 HTTP 真实提交"
+        />
+
         <!-- 执行控制 -->
         <el-card class="mb-4">
           <template #header><span>执行控制</span></template>
@@ -178,6 +201,20 @@ import { useRoute } from 'vue-router'
 import { useTaskStore } from '../stores/taskStore'
 import { executeTask } from '../utils/autoFiller'
 import { importConfigFromFile } from '../utils/configManager'
+
+const proxyStatus = ref('checking') // checking | online | offline
+
+async function checkProxyStatus() {
+  proxyStatus.value = 'checking'
+  try {
+    const resp = await fetch('http://127.0.0.1:3001/api/health', {
+      signal: AbortSignal.timeout(2000),
+    })
+    proxyStatus.value = resp.ok ? 'online' : 'offline'
+  } catch {
+    proxyStatus.value = 'offline'
+  }
+}
 import { ElMessage } from 'element-plus'
 
 const route = useRoute()
@@ -201,6 +238,7 @@ const configuredTasks = computed(() =>
 )
 
 onMounted(async () => {
+  checkProxyStatus()
   await taskStore.loadTasks()
   // 优先从路由参数加载；其次选第一个可用任务
   if (selectedTaskId.value) {
