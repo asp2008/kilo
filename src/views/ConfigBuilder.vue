@@ -118,20 +118,55 @@
             <el-form-item label="API Key" v-if="captchaConfig.solver === 'api'">
               <el-input v-model="captchaConfig.apiKey" type="password" show-password />
             </el-form-item>
+            <el-form-item label="验证码长度" v-if="captchaConfig.enabled">
+              <el-input-number v-model="captchaConfig.captchaLength" :min="1" :max="10" />
+              <span class="muted" style="margin-left:8px">OCR 结果不足此长度时转为人工输入</span>
+            </el-form-item>
           </el-form>
         </el-collapse-item>
 
         <el-collapse-item title="🚀 执行设置" name="exec">
-          <el-form label-width="120px">
+          <el-form label-width="130px">
             <el-form-item label="自动提交">
               <el-switch v-model="form.autoSubmit" />
               <span class="muted" style="margin-left: 8px">填完后自动点击提交按钮</span>
             </el-form-item>
             <el-form-item label="提交按钮" v-if="form.autoSubmit">
-              <el-input v-model="form.submitSelector" placeholder="CSS 选择器，例：button[type=submit]" />
+              <el-input v-model="form.submitSelector" placeholder="CSS 选择器，例：input[type=submit]" />
+            </el-form-item>
+            <el-form-item label="最大重试次数">
+              <el-input-number v-model="form.maxAttempts" :min="1" :max="10" />
+              <span class="muted" style="margin-left:8px">验证码失败后自动重试</span>
             </el-form-item>
             <el-form-item label="执行延迟 (ms)">
               <el-input-number v-model="form.delay" :min="0" :max="5000" :step="100" />
+            </el-form-item>
+          </el-form>
+        </el-collapse-item>
+
+        <el-collapse-item title="✅ 成功/失败关键词" name="keywords">
+          <el-form label-width="130px">
+            <el-form-item label="成功关键词">
+              <el-select
+                v-model="form.successKeywords"
+                multiple
+                filterable
+                allow-create
+                placeholder="输入后按 Enter 添加"
+                style="width:100%"
+              />
+              <div class="muted" style="margin-top:4px;font-size:12px">页面包含任一关键词 → 判断为成功（留空则仅靠页面跳转判断）</div>
+            </el-form-item>
+            <el-form-item label="失败关键词">
+              <el-select
+                v-model="form.failureKeywords"
+                multiple
+                filterable
+                allow-create
+                placeholder="输入后按 Enter 添加"
+                style="width:100%"
+              />
+              <div class="muted" style="margin-top:4px;font-size:12px">默认: エラー / error / もう一度 / 認証失敗 等</div>
             </el-form-item>
           </el-form>
         </el-collapse-item>
@@ -230,14 +265,18 @@ const form = ref({
   name: '',
   url: '',
   autoSubmit: false,
-  submitSelector: 'button[type="submit"]',
+  submitSelector: 'input[type="submit"],button[type="submit"]',
   delay: 300,
+  maxAttempts: 5,
+  successKeywords: [],
+  failureKeywords: [],
 })
 
 const captchaConfig = ref({
   enabled: false,
   solver: 'tesseract',
   apiKey: '',
+  captchaLength: 4,
 })
 
 const taskId = route.params.id
@@ -259,6 +298,9 @@ onMounted(async () => {
         form.value.autoSubmit = task.config.autoSubmit || false
         form.value.submitSelector = task.config.submitSelector || form.value.submitSelector
         form.value.delay = task.config.delay || 300
+        form.value.maxAttempts = task.config.maxAttempts || 5
+        form.value.successKeywords = task.config.successKeywords || []
+        form.value.failureKeywords = task.config.failureKeywords || []
         if (parsedFields.value.length) step.value = 2
       }
     }
@@ -325,6 +367,9 @@ async function saveConfig() {
     autoSubmit: form.value.autoSubmit,
     submitSelector: form.value.submitSelector,
     delay: form.value.delay,
+    maxAttempts: form.value.maxAttempts,
+    successKeywords: form.value.successKeywords,
+    failureKeywords: form.value.failureKeywords,
     updatedAt: new Date().toISOString(),
   }
 

@@ -1,6 +1,12 @@
 /**
  * KiloForm Playwright 执行引擎
- * WebSocket 服务器，前端发送任务配置，实时推送执行日志和截图
+ * WebSocket 服务器，前端发任务配置，实时推送日志/截图/验证码
+ *
+ * 移植并增强自参考 Python 脚本：
+ *  - 多候选 OCR（6x放大 + 多阈值二值化）
+ *  - 自动重试（失败则刷新页面重试，最多 maxAttempts 次）
+ *  - 可配置成功/失败关键词
+ *  - 直接截取验证码元素（不是整个页面截图）
  *
  * 启动: node server/playwright-engine.mjs
  * 端口: 3002
@@ -9,52 +15,45 @@
 import { chromium } from 'playwright'
 import { WebSocketServer } from 'ws'
 import { createServer } from 'http'
+import { multiCandidateOcr } from './ocr-helper.mjs'
 
 const PORT = 3002
 
-// HTTP 服务（健康检查）
 const httpServer = createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ ok: true }))
   } else {
-    res.writeHead(404)
-    res.end()
+    res.writeHead(404); res.end()
   }
 })
 
 const wss = new WebSocketServer({ server: httpServer })
 
-// 全局浏览器实例（复用）
 let browser = null
-
 async function getBrowser() {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
-      headless: false,   // 显示浏览器窗口，方便用户观察
-      args: [
-        '--no-sandbox',
-        '--disable-blink-features=AutomationControlled',   // 隐藏自动化特征
-        '--disable-infobars',
-      ],
+      headless: false,
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
     })
   }
   return browser
 }
 
-// ─── WebSocket 连接处理 ───────────────────────────────────────────────────────
+// ─── WebSocket ───────────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
   console.log('[ws] 客户端已连接')
 
-  const send = (type, payload) => {
-    if (ws.readyState === 1) {
-      ws.send(JSON.stringify({ type, ...payload }))
-    }
-  }
+  // 验证码等待队列
+  const captchaQueue = []
 
-  const log = (level, message) => {
-    console.log(`[${level}] ${message}`)
-    send('log', { level, message, timestamp: new Date().toISOString() })
+  const send = (type, payload) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type, ...payload }))
+  }
+  const log = (level, msg) => {
+    console.log(`[${level}] ${msg}`)
+    send('log', { level, message: msg, timestamp: new Date().toISOString() })
   }
 
   ws.on('message', async (raw) => {
@@ -63,7 +62,7 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'run') {
       try {
-        await runTask(msg.task, log, send)
+        await runTask(msg.task, log, send, captchaQueue)
         send('done', { success: true })
       } catch (e) {
         log('error', `执行异常: ${e.message}`)
@@ -72,25 +71,30 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'captcha_reply') {
-      // 验证码用户输入回调（通过全局 resolver）
-      if (global.__captchaResolvers) {
-        const resolver = global.__captchaResolvers.shift()
-        if (resolver) resolver(msg.value || '')
-      }
+      const resolve = captchaQueue.shift()
+      resolve?.(msg.value || '')
     }
 
     if (msg.type === 'stop') {
-      log('warn', '用户请求停止')
+      log('warn', '用户停止执行')
       send('done', { success: false, error: '用户停止' })
     }
   })
 
-  ws.on('close', () => console.log('[ws] 客户端断开'))
+  ws.on('close', () => console.log('[ws] 断开'))
 })
 
-// ─── 核心执行逻辑 ─────────────────────────────────────────────────────────────
-async function runTask(task, log, send) {
-  global.__captchaResolvers = []
+// ─── 主执行逻辑 ───────────────────────────────────────────────────────────────
+async function runTask(task, log, send, captchaQueue) {
+  const cfg = task.config || {}
+  const fields = deduplicateFields(cfg.fields || [])
+  const captchaField = fields.find(f => f.isCaptcha)
+
+  // 成功/失败关键词（从任务配置读取）
+  const successKws = cfg.successKeywords || []
+  const failureKws = cfg.failureKeywords || ['エラー', 'error', 'invalid', '错误', '失敗', 'もう一度', '認証.*失敗']
+  const captchaLen = cfg.captcha?.captchaLength || 4
+  const maxAttempts = cfg.maxAttempts || 5
 
   const b = await getBrowser()
   const context = await b.newContext({
@@ -100,135 +104,149 @@ async function runTask(task, log, send) {
   const page = await context.newPage()
 
   try {
-    // 1. 打开目标页面
-    log('info', `打开页面: ${task.url}`)
-    await page.goto(task.url, { waitUntil: 'domcontentloaded', timeout: 20000 })
-    log('info', '页面加载完成')
+    // ── 重试循环（对应 Python 的 for attempt in range(max_attempts)）──
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      log('info', attempt === 1 ? `打开页面: ${task.url}` : `[重试 ${attempt}/${maxAttempts}] 刷新页面...`)
 
-    const fields = deduplicateFields(task.config?.fields || [])
+      await page.goto(task.url, { waitUntil: 'domcontentloaded', timeout: 20000 })
+      await page.waitForTimeout(500)
 
-    // 2. 逐字段填充
-    for (const field of fields) {
-      if (field.type === 'hidden' || field.type === 'file') continue
+      // ── 填充普通字段 ──
+      for (const field of fields) {
+        if (field.type === 'hidden' || field.type === 'file' || field.isCaptcha) continue
+        if (!field.fillValue && field.fillValue !== 0) continue
 
-      if (field.isCaptcha) {
-        await handleCaptcha(page, field, task, log, send)
-        continue
+        try {
+          const el = await page.$(field.selector)
+          if (!el) { log('warn', `未找到: ${field.selector}`); continue }
+
+          const tag = await el.evaluate(e => e.tagName.toLowerCase())
+          const type = await el.evaluate(e => (e.type || '').toLowerCase())
+
+          if (tag === 'select') {
+            await el.selectOption({ value: String(field.fillValue) }).catch(() =>
+              el.selectOption({ label: String(field.fillValue) })
+            )
+          } else if (type === 'checkbox' || type === 'radio') {
+            const checked = ['true', '1', 'yes', 'on'].includes(String(field.fillValue).toLowerCase())
+            checked ? await el.check({ force: true }) : await el.uncheck({ force: true })
+          } else {
+            await el.fill(String(field.fillValue))
+          }
+          log('info', `填充 "${field.label || field.key}" = "${String(field.fillValue).slice(0, 60)}"`)
+          await page.waitForTimeout(100)
+        } catch (e) {
+          log('warn', `字段 "${field.key}" 填充失败: ${e.message}`)
+        }
       }
 
-      if (!field.fillValue && field.fillValue !== 0) {
-        log('warn', `"${field.label || field.key}" 无填充值，跳过`)
-        continue
-      }
-
-      try {
-        const el = await page.$(field.selector)
-        if (!el) {
-          log('warn', `未找到元素: ${field.selector}`)
+      // ── 验证码处理 ──
+      let captchaText = ''
+      if (captchaField) {
+        captchaText = await handleCaptcha(page, captchaField, cfg, captchaLen, attempt, log, send, captchaQueue)
+        if (!captchaText) {
+          log('warn', `[尝试 ${attempt}] 验证码为空，跳过本次提交`)
           continue
         }
+      }
 
-        const tagName = await el.evaluate(e => e.tagName.toLowerCase())
-        const elType = await el.evaluate(e => e.type?.toLowerCase())
+      // ── 提交 ──
+      if (cfg.autoSubmit !== false) {
+        const submitSel = cfg.submitSelector ||
+          'input[type="submit"],button[type="submit"],button:has-text("投稿"),button:has-text("送信"),button:has-text("Submit")'
 
-        if (tagName === 'select') {
-          await el.selectOption({ value: String(field.fillValue) })
-        } else if (elType === 'checkbox' || elType === 'radio') {
-          const checked = String(field.fillValue).toLowerCase()
-          if (['true', '1', 'yes', 'on'].includes(checked)) {
-            await el.check()
-          }
-        } else {
-          await el.fill(String(field.fillValue))
+        log('info', '点击提交...')
+        try {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+            page.click(submitSel, { timeout: 5000 }).catch(() =>
+              page.evaluate(() => document.querySelector('form')?.submit())
+            ),
+          ])
+        } catch (e) {
+          log('warn', `提交等待超时，继续分析页面: ${e.message}`)
         }
-
-        log('info', `填充 "${field.label || field.key}" = "${String(field.fillValue).slice(0, 60)}"`)
-        await page.waitForTimeout(150)
-      } catch (e) {
-        log('warn', `字段 "${field.key}" 填充失败: ${e.message}`)
-      }
-    }
-
-    // 3. 自动提交
-    if (task.config?.autoSubmit) {
-      await page.waitForTimeout(300)
-      log('info', '点击提交按钮...')
-
-      const submitSel = task.config.submitSelector ||
-        'input[type="submit"], button[type="submit"], button:has-text("投稿"), button:has-text("送信"), button:has-text("Submit")'
-
-      const submitBtn = await page.$(submitSel)
-      if (submitBtn) {
-        await submitBtn.click()
-      } else {
-        await page.evaluate(() => document.querySelector('form')?.submit())
+        await page.waitForTimeout(1000)
       }
 
-      // 4. 等待页面响应
-      log('info', '等待页面响应...')
-      await page.waitForTimeout(2000)
-
-      // 5. 判断结果
-      await analyzeResult(page, task.url, log, send)
-    } else {
-      log('info', '自动提交未启用，已填充完毕')
-      const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 })
+      // ── 截图 ──
+      const screenshot = await page.screenshot({ type: 'jpeg', quality: 75 })
       send('screenshot', { data: screenshot.toString('base64') })
-    }
 
+      // ── 结果分析 ──
+      const result = await analyzeResult(page, task.url, successKws, failureKws, log, send)
+
+      if (result === 'success') {
+        log('success', `✅ 第 ${attempt} 次尝试成功！`)
+        return
+      } else if (result === 'failure') {
+        if (attempt < maxAttempts) {
+          log('warn', `❌ 第 ${attempt} 次失败，准备重试...`)
+          await page.waitForTimeout(800)
+          // 继续 for 循环（会 goto 刷新页面）
+        } else {
+          log('error', `❌ 已达最大重试次数 (${maxAttempts})，放弃`)
+          return
+        }
+      } else {
+        // unknown — 无法判断，展示给用户
+        log('warn', `⚠️ 第 ${attempt} 次：无法确认结果，请查看截图`)
+        return
+      }
+    }
   } finally {
     await context.close()
   }
 }
 
 // ─── 验证码处理 ───────────────────────────────────────────────────────────────
-async function handleCaptcha(page, field, task, log, send) {
+async function handleCaptcha(page, field, cfg, captchaLen, attempt, log, send, captchaQueue) {
   log('info', `处理验证码字段: "${field.label || field.key}"`)
 
-  const solver = task.config?.captcha?.solver || 'tesseract'
-  let captchaText = ''
+  const solver = cfg.captcha?.solver || 'tesseract'
 
-  // 找验证码图片元素
-  const captchaImgEl = await findCaptchaImage(page, field.selector)
+  // 截取验证码图片元素（直接截图元素，比截全屏更精准）
+  const captchaImgEl = await findCaptchaImageElement(page, field.selector)
+  let captchaBuffer = null
 
   if (captchaImgEl) {
-    // 截取验证码图片
-    const imgBuffer = await captchaImgEl.screenshot({ type: 'png' })
-    const imgBase64 = `data:image/png;base64,${imgBuffer.toString('base64')}`
-    log('info', '已截取验证码图片')
-    send('captcha_image', { data: imgBase64 })
+    captchaBuffer = await captchaImgEl.screenshot({ type: 'png' })
+    log('info', `验证码图片已截取 (${captchaBuffer.length} bytes)`)
 
-    if (solver === 'manual') {
-      // 等待用户输入
-      captchaText = await waitForCaptchaInput(log)
+    // 发送验证码图片到前端预览
+    send('captcha_image', { data: `data:image/png;base64,${captchaBuffer.toString('base64')}` })
+  } else {
+    log('warn', '未找到独立验证码图片元素，截取整个页面供参考')
+    const full = await page.screenshot({ type: 'jpeg', quality: 60 })
+    send('captcha_image', { data: `data:image/jpeg;base64,${full.toString('base64')}` })
+  }
+
+  let captchaText = ''
+
+  if (solver === 'manual') {
+    log('info', '⏳ 等待人工输入验证码...')
+    captchaText = await waitForCaptchaInput(captchaQueue, 60000)
+    log('info', `人工输入: "${captchaText}"`)
+  } else if (captchaBuffer) {
+    // 多候选 OCR（移植自 Python build_candidates + ocr_with_candidates）
+    log('info', `OCR 多候选识别中（期望长度 ${captchaLen}）...`)
+    const { text, logs: ocrLogs } = await multiCandidateOcr(captchaBuffer, captchaLen)
+
+    const logStr = ocrLogs.map(l => `${l.label}:${l.text}`).join(' | ')
+    log('info', `OCR 候选: ${logStr}`)
+    log('info', `OCR 最终结果: "${text}"`)
+
+    if (text.length >= captchaLen) {
+      captchaText = text
     } else {
-      // Tesseract OCR（动态加载）
-      try {
-        const { createWorker } = await import('tesseract.js')
-        log('info', 'OCR 识别中...')
-        const worker = await createWorker('eng')
-        await worker.setParameters({
-          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
-        })
-        const { data: { text } } = await worker.recognize(imgBuffer)
-        await worker.terminate()
-        captchaText = text.trim().replace(/\s+/g, '')
-        log('info', `OCR 结果: "${captchaText}"`)
-      } catch (e) {
-        log('warn', `OCR 失败: ${e.message}，转为人工输入`)
-      }
-
-      if (!captchaText) {
-        log('warn', 'OCR 无法识别，请人工输入验证码')
-        captchaText = await waitForCaptchaInput(log)
-      }
+      // OCR 结果不够 → 转人工
+      log('warn', `OCR 结果 "${text}" 不足 ${captchaLen} 位，转为人工输入`)
+      captchaText = await waitForCaptchaInput(captchaQueue, 60000)
+      log('info', `人工输入: "${captchaText}"`)
     }
   } else {
-    // 截图整个页面帮助用户定位
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 })
-    send('captcha_image', { data: `data:image/jpeg;base64,${screenshot.toString('base64')}` })
-    log('warn', '未找到验证码图片，请在截图中查看并人工输入')
-    captchaText = await waitForCaptchaInput(log)
+    log('warn', '无验证码图片，人工输入')
+    captchaText = await waitForCaptchaInput(captchaQueue, 60000)
   }
 
   // 填入验证码
@@ -243,101 +261,109 @@ async function handleCaptcha(page, field, task, log, send) {
       log('warn', `验证码填入失败: ${e.message}`)
     }
   }
+
+  return captchaText
 }
 
-async function findCaptchaImage(page, inputSelector) {
-  // 在输入框附近找图片
-  const img = await page.evaluate((sel) => {
+// ─── 查找验证码图片元素 ────────────────────────────────────────────────────────
+async function findCaptchaImageElement(page, inputSelector) {
+  // 策略1: 找输入框附近的 img
+  const imgEl = await page.evaluate((sel) => {
     const input = document.querySelector(sel)
     if (!input) return null
     const root = input.closest('.captcha,.verify-group,form,.form-group,tr,td') || input.parentElement
     if (!root) return null
-    const img = root.querySelector('img[src*="captcha"],img[src*="verify"],img[src*="code"],img[src*="check"],img[src*="kana"],img')
-    return img ? img.src : null
+    const candidates = [
+      root.querySelector("img[src*='captcha']"),
+      root.querySelector("img[src*='verify']"),
+      root.querySelector("img[src*='code']"),
+      root.querySelector("img[src*='kana']"),
+      root.querySelector("img[alt*='キー']"),
+      root.querySelector("img[alt*='認証']"),
+      root.querySelector('img'),
+    ]
+    const found = candidates.find(Boolean)
+    return found ? found.getAttribute('src') : null
   }, inputSelector)
 
-  if (!img) return null
+  if (!imgEl) return null
 
-  // 用 src 找到元素
-  return page.$(`img[src="${img}"]`).catch(() => null)
+  // 策略2: 通过 src 定位元素
+  return page.$(`img[src="${imgEl}"]`).catch(() => null)
 }
 
-function waitForCaptchaInput(log) {
-  return new Promise(resolve => {
-    log('info', '⏳ 等待人工输入验证码...')
-    global.__captchaResolvers.push(resolve)
-    // 60 秒超时
-    setTimeout(() => resolve(''), 60000)
-  })
-}
-
-// ─── 结果分析 ─────────────────────────────────────────────────────────────────
-async function analyzeResult(page, originalUrl, log, send) {
+// ─── 结果分析（移植自 Python detect_result）─────────────────────────────────
+async function analyzeResult(page, originalUrl, successKws, failureKws, log, send) {
   const currentUrl = page.url()
-  const pageTitle = await page.title().catch(() => '')
+  const title = await page.title().catch(() => '')
 
-  // 抓取页面纯文字（去脚本/样式）
   const bodyText = await page.evaluate(() => {
     const clone = document.body.cloneNode(true)
-    clone.querySelectorAll('script,style,noscript').forEach(el => el.remove())
-    return clone.innerText || clone.textContent || ''
+    clone.querySelectorAll('script,style,noscript').forEach(e => e.remove())
+    return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim()
   }).catch(() => '')
 
-  const text = bodyText.replace(/\s+/g, ' ').trim()
-  const snippet = text.slice(0, 500)
-
-  log('info', `当前 URL: ${currentUrl}`)
-  log('info', `页面标题: ${pageTitle}`)
-
+  const snippet = bodyText.slice(0, 500)
   const redirected = currentUrl !== originalUrl
 
-  // 成功关键词
+  log('info', `当前 URL: ${currentUrl}`)
+  if (title) log('info', `页面标题: ${title}`)
+
+  // 先检查失败关键词（优先级更高，对应 Python detect_result 的顺序）
+  const defaultFailPatterns = [
+    /エラー|error/i, /认证.*失败|認証.*失敗|captcha.*wrong/i,
+    /もう一度|再入力|try again/i, /invalid|incorrect/i,
+    /不正|失敗|失败|错误/i, /spam|bot/i,
+  ]
+  const failPatterns = [
+    ...defaultFailPatterns,
+    ...failureKws.map(k => new RegExp(k, 'i')),
+  ]
   const successPatterns = [
     /投稿しました|投稿完了|書き込み.*完了|送信.*完了|登録.*完了/,
-    /success|posted|registered|ありがとう|thank you/i,
-    /記事が投稿|コメントが送信|メッセージが/,
+    /success|posted|registered|ありがとう|thank/i,
     /完成|成功|提交成功/,
-  ]
-  // 失败关键词
-  const errorPatterns = [
-    /エラー|error|错误|失敗|失败/i,
-    /認証.*失敗|captcha.*wrong|画像認証|入力.*間違/,
-    /regikey|スパム|spam/i,
-    /もう一度|再入力|やり直|try again/i,
-    /invalid|incorrect|not found/i,
+    ...successKws.map(k => new RegExp(k, 'i')),
   ]
 
-  const isSuccess = successPatterns.some(p => p.test(text))
-  const isError = errorPatterns.some(p => p.test(text))
+  const foundFail = failPatterns.find(p => p.test(bodyText))
+  const foundSuccess = successPatterns.find(p => p.test(bodyText))
 
-  // 截图
-  const screenshot = await page.screenshot({ type: 'jpeg', quality: 75 })
-  send('screenshot', { data: screenshot.toString('base64') })
+  log('info', `页面内容（前500字）: ${snippet}`)
 
-  if (isSuccess && !isError) {
-    log('success', `✅ 提交成功！`)
-    if (redirected) log('success', `页面跳转到: ${currentUrl}`)
-    log('info', `页面内容: ${snippet}`)
-  } else if (isError) {
-    log('error', `❌ 提交失败，服务端报错`)
-    log('error', `页面内容: ${snippet}`)
-  } else if (redirected) {
-    log('success', `✅ 提交完成（页面已跳转到: ${currentUrl}）`)
-    log('info', `页面内容: ${snippet}`)
-  } else {
-    log('warn', `⚠️ 提交完成，请查看截图确认结果`)
-    log('info', `页面内容（前500字）: ${snippet}`)
+  if (foundFail) {
+    const match = bodyText.match(foundFail)
+    log('error', `❌ 失败: 检测到关键词 "${match?.[0]}"`)
+    return 'failure'
   }
+  if (foundSuccess) {
+    const match = bodyText.match(foundSuccess)
+    log('success', `✅ 成功: 检测到关键词 "${match?.[0]}"`)
+    return 'success'
+  }
+  if (redirected) {
+    log('success', `✅ 页面已跳转至: ${currentUrl}，判断为成功`)
+    return 'success'
+  }
+
+  log('warn', '⚠️ 无法自动判断结果，请查看截图')
+  return 'unknown'
 }
 
-// ─── 工具 ─────────────────────────────────────────────────────────────────────
+// ─── 工具函数 ─────────────────────────────────────────────────────────────────
 function deduplicateFields(fields) {
   const seen = new Set()
   return fields.filter(f => { if (seen.has(f.key)) return false; seen.add(f.key); return true })
 }
 
+function waitForCaptchaInput(queue, timeout = 60000) {
+  return new Promise((resolve) => {
+    queue.push(resolve)
+    setTimeout(() => resolve(''), timeout)
+  })
+}
+
 // ─── 启动 ─────────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, '127.0.0.1', () => {
   console.log(`✅ KiloForm Playwright 引擎已启动: ws://127.0.0.1:${PORT}`)
-  console.log('等待前端连接...')
 })
