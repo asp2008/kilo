@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import path from 'path'
+import enginePlugin from './vite-plugin-engine.js'
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), enginePlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

@@ -242,8 +242,17 @@ onMounted(async () => {
     selectedTaskId.value = configuredTasks.value[0].id
     await loadSelectedTask(selectedTaskId.value)
   }
-  checkEngineStatus()
+  // 引擎可能还在启动中，最多重试 8 次
+  await pollEngineStatus()
 })
+
+async function pollEngineStatus() {
+  for (let i = 0; i < 8; i++) {
+    await checkEngineStatus()
+    if (engineStatus.value === 'online') return
+    await new Promise(r => setTimeout(r, 1000))
+  }
+}
 
 async function loadSelectedTask(id) {
   task.value = await taskStore.loadTask(id)
